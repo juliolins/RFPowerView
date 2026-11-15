@@ -26,7 +26,7 @@ Library for sending and receiving PowerView packets so that blinds can be contro
 #define RF_IRQ_PIN  4
 
 // Copied from Powerview Hub userdata API. Open http://POWERVIEW_HUB_IP_ADDRESS/api/userdata/ and find the field labeled "rfID"
-#define RF_ID       0x2ECB
+#define RF_ID       0x2EC8
 
 RFPowerView powerView(RF_CE_PIN, RF_CS_PIN, RF_IRQ_PIN, RF_ID);
 
@@ -60,17 +60,22 @@ A PowerView packet consists of a header (which contains a variable length addres
 
 | Byte Offset | Size (Bits) | Name | Description | Valid Values |
 |---|---|---|---|---|
-| 0 | 8 | ID Byte | Identifies the start of a new packet. | `0xCO` |
+| 0 | 8 | ID Byte | Identifies the start of a new packet. | `0xC0` |
 | 1 | 8 | Length | Specifies how many bytes of header and data come after this byte (excludes checksum bytes). | `0x0A` - `0x1D` |
-| 2 | 8 | Unknown | Could indicate the type of sender | `0x00` (from hub or remote), `0x01` (from blind) |
+| 2 | 8 | Unknown | Could indicate the type of sender | `0x00` (from hub, remote or repeater), `0x10` (from blind; on one installation `0x10` while at rest and `0x00` while moving) |
 | 3 | 8 | Fixed | This byte is always the same. | `0x05` |
-| 4 | 8 | Rolling Code 1 | This byte is incremented by 0x01 each time a packet is sent. | `0x00`-`0xFF` |
+| 4 | 8 | Rolling Code 1 | The hub increments this byte by 0x01 for each new command. All copies of a packet in a burst share the same value. A repeater replaces it with its own counter. | `0x00`-`0xFF` |
 | 5 | 16 | Fixed | These two bytes are always the same. | `0xFFFF` |
 | 7 | 16 | Physical Source ID | The ID of device that actually sent the packet (can be different to Logical Source ID when a repeater is being used) | `0x0000`-`0xFFFF` |
 | 9 | 8 | Unknown | This byte might indicate if the packet was retransmitted by a repeater | `0x86` (when sent from hub or remote), `0x85` (when sent from repeater) |
 | 10 | 8 | Address Type | Indicates which type of address this packet is using. | `0x04` (Broadcast), `0x05` (Unicast), `0x06` (Groups) |
-| 11 | 8 | Rolling Code 2 | This byte is incremented by 0x01 each time a packet is sent. | `0x00`-`0xFF` |
+| 11 | 8 | Rolling Code 2 | The hub increments this byte by 0x01 for each new command. All copies of a packet in a burst share the same value. A repeater keeps it unchanged. | `0x00`-`0xFF` |
 | 12 | Varies | Address | This section is a variable length. | Broadcast, Unicast, or Groups section (see next section) |
+
+Note on rolling codes and relayed copies:
+- On one installation, a pebble remote's new pair of rolling codes for each button press looked random rather than incremented, so it is safer to treat the pair as a per-command tag than as a counter.
+- On one installation, a second PowerView hub relayed every hub command. Its copy keeps Physical Source ID `0x0000` and `0x86` in byte 9, uses its own Rolling Code 1 and keeps Rolling Code 2, so it can't be told apart from the original by those fields.
+- Copies of one command (original, repeater, second hub) can be matched on address + payload + Rolling Code 2.
 
 #### Broadcast address
 | Byte Offset | Size (Bits) | Name | Description | Valid Values |
@@ -90,11 +95,16 @@ Note: this type of address is used when a hub wants to communicate with a specif
 #### Groups address
 | Byte Offset | Size (Bits) | Name | Description | Valid Values |
 |---|---|---|---|---|
-| 0-5 | 8 | Group Number | Devices assigned to the specified group numbers should process the packet. | `0x01`-`0x06` |
+| 0-5 | 8 | Group Number | Devices assigned to the specified group numbers should process the packet. | `0x01`-`0x06` (pebble remote), higher numbers (hub) |
 | n | 8 | Terminator | Marker to stop processing group numbers | `0x00` |
 | n+1 | 16 | Logical Source ID | The ID of device where the packet originated | `0x0000`-`0xFFFF` |
 
-Note: this type of address is used by pebble remotes. The Group Number corresponds to the the numbered buttons on the pebble remote. When multiple group numbers are included, generally they are in ascending order.
+Note: this type of address is used by pebble remotes. The Group Number corresponds to the numbered buttons on the pebble remote. When multiple group numbers are included, generally they are in ascending order. On one installation the hub also used it, with Logical Source ID `0x0000` and group numbers above 6, for room-wide set position commands (eg. a room group number such as `0x20`).
+
+#### Device IDs
+Observed on one installation:
+- A blind's 2-byte radio ID is the shade `id` from the hub's HTTP API with its two bytes swapped (eg. an API `id` of `61774` (`0xF14E`) would be radio ID `0x4EF1`).
+- Blinds ignored unicast commands sent with a pebble remote's ID as the source. From a remote's ID, only the Groups address worked.
 
 ### Payload
 This section begins at the next byte following the variable length address section. I've observed two types of payloads: simple and "fields".
@@ -124,12 +134,27 @@ Note: this type of payload is used by the hub. If sent to a blind without values
 | 1 | 8 | Field Mode | Indicates how value should be used | `0x3F` (fetch), `0x40` (set), `0x21` (value) |
 | 2 | 8 | Field ID | The field ID | `0x00`-`0xFF`, eg. `0x50` is Position, `0x42` is Battery level |
 | 3 (if length=3) | 8 | Field Value | The value of the field | `0x00`-`0xFF` |
-| 3 (if length=4) | 16 | Field Value | The value of the field | `0x0000`-`0xFFFF` |
+| 3 (if length=4) | 16 | Field Value | The value of the field, little-endian (low byte first) | `0x0000`-`0xFFFF` |
+
+Note: 16-bit field values are little-endian, eg. field `0421504001` has the value `0x0140`. (The IDs in the header are big-endian.)
+
+#### Other payloads
+Observed on one installation (the scene activation is from the sample packet below):
+
+| Payload | Direction | Description |
+|---|---|---|
+| `3F 46 4E` | Hub to blind (Unicast) | Sent by the hub, usually right after a read went unanswered. The blind answers with `21 46 4E` followed by a few bytes (eg. `21464E98070801` in `test/test_crc/test_crc.cpp`). The meaning of those bytes is unknown. |
+| `53 43 <Scene ID>` | Hub to blind (Unicast) | Store scene. Sent when a blind is added to a scene. |
+| `53 47 <Scene ID>` | Hub (Broadcast) | Activate scene (see sample packet below). |
 
 ### Checksum
 | Byte Offset | Size (Bits) | Name | Description | Valid Values |
 |---|---|---|---|---|
-| 0 | 16 | Checksum | A CRC16 checksum of the packet data | `0x0000`-`0xFFFF` |
+| 0 | 16 | Checksum | A CRC16 checksum of the packet data, high byte first | `0x0000`-`0xFFFF` |
+
+The checksum is CRC-16 with polynomial `0x755B`, initial value `0xFFFF`, no reflection and no final XOR. It is calculated over the network's 2-byte radio address (the hub's `rfID`, high byte first) followed by packet bytes 0 to L+1 (everything except the checksum). The `rfID` itself is not transmitted.
+
+Processing the `rfID` first is the same as starting from a different initial value: for `rfID` `0x2EC8` (the network the sample packets below come from) that value is `0xF48B`. A fixed initial value of `0xF48B` therefore only produces valid checksums on that one network; other networks need the value derived from their own `rfID`.
 
 ## Sample Packets
 
@@ -186,7 +211,7 @@ C0151005E0FFFF4EF186051A00004EF1215A04215040016670
 | 11 | Rolling Code 2 | `0x1A` |  |
 | 12 | Destination ID | `0x0000` | ID of hub |
 | 14 | Logical Source ID | `0x4EF1` | ID of blind |
-| 18 | Field 1 | `0421504001` | Field of 4 bytes, Mode = `0x21` (value), ID = `0x50` (position), Value = `0x4001` |
+| 18 | Field 1 | `0421504001` | Field of 4 bytes, Mode = `0x21` (value), ID = `0x50` (position), Value = `0x0140` (little-endian) |
 | 23 | Checksum  | `0x6670` |  |
 
 
