@@ -65,6 +65,8 @@ struct Packet {
   PacketParameters parameters;
   uint8_t rollingCode1;
   uint8_t rollingCode2;
+  uint16_t physicalSource = 0; // ID of the device that transmitted this copy (a repeater when relayed)
+  bool repeated = false;       // True when the packet was retransmitted by a repeater
 };
 
 
